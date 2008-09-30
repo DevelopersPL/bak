@@ -3,7 +3,7 @@ Name: bak
 Version: 0.1
 Release: 1
 License: GPL
-Group: 
+Group: Admin
 URL: http://notes.brooks.nu
 Source0: %{name}-%{version}.tar.gz
 BuildRoot: %{_tmppath}/%{name}-%{version}-%{release}-root
@@ -18,7 +18,7 @@ Backup script utilizing rsync, hard links, and rotation
 
 %install
 rm -rf $RPM_BUILD_ROOT
-make install
+make install prefix=$RPM_BUILD_ROOT
 
 %clean
 rm -rf $RPM_BUILD_ROOT
