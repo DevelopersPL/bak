@@ -1,0 +1,182 @@
+#!/usr/bin/env python
+#
+# This is a backup script that uses hard-link rotation and rsync.  Hard-links
+# enable efficient incremental backups.
+#
+# Author: Lane Brooks 
+# Date: 9/29/2008
+# Inspiration: This is based on a sh script from Keith Fife and Brice Burgess.
+#
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+def require(key, kw):
+    try:
+        return kw[key]
+    except KeyError:
+        raise Exception("You must specify a %s key" % key)
+
+def default(key, def_value, kw):
+    try:
+        return kw[key]
+    except KeyError:
+        return def_value
+
+# object used to hold the options for each backup
+class BackupSpec(object):
+    def __init__(self, name, items):
+        kv={}
+        for k,v in items:
+            kv[k]=v
+
+        self.dest_dir = require("dest_dir", kv)
+        self.rsync_options = default("rsync_options", "", kv) 
+        self.host = require("host", kv) # host to be backed-up
+        self.sources = require("sources", kv) # directories on host to be backed-up
+        self.exclude = default("exclude", "", kv) # list of directories/files/globs to be excluded from backup
+
+        self.name = name
+        self.rsync_options= default("rsync_options", "", kv)
+        self.num_days  = int(default("num_days",   14, kv))
+        self.num_weeks = int(default("num_weeks",  10, kv))
+        self.num_months= int(default("num_months", 12, kv))
+        self.num_years = int(default("num_years",  10, kv))
+        
+
+
+import getopt, sys, os
+from datetime import date
+from ConfigParser import ConfigParser
+
+def usage():
+    print "backup [-c config_file]"
+
+
+# Parse command line options
+conf="/etc/bak.conf"
+opts,args = getopt.getopt(sys.argv[1:], "hc:", ["help", "conf="])
+for o,a in opts:
+    if o in ("-h", "--help"):
+        usage()
+        sys.exit()
+    elif o in ("-c", "--conf"):
+        conf=os.path.abspath(a)
+    else:
+        print "Unkown option %s" % o
+        usage()
+        sys.exit()
+
+# check if config file exists
+if not os.path.exists(conf):
+    print "Conf file %s not found. Aborting backup" % conf
+else:
+    print "Using config file %s" % conf
+config = ConfigParser()
+config.read(conf)
+
+# get the date
+now = date.today()
+
+# loop through each host specified in the config file
+for section in config.sections():
+    bak = BackupSpec(section, config.items(section))
+
+    # create the destination directory if it does not exist
+    if not os.path.exists(bak.dest_dir):
+        if os.system("mkdir -p %s" % bak.dest_dir) != 0:
+            print "Error creating backup destination directory %s.  Probably a permission issue." % bak.dest_dir
+            continue
+
+    # get today's date
+    backup_date = date.today().strftime("%Y-%m-%d")
+
+    # figure out where we are going to backup to and create the directory
+    # if it does not exist
+    target_dir = bak.dest_dir + "/" + bak.name
+    if not os.path.exists(target_dir):
+        os.mkdir(target_dir)
+    target_dir = os.path.abspath(target_dir)
+
+    # generate the backup dir using today's date and delete it if it exists
+    backup_dir  = target_dir + "/" + backup_date
+    if os.path.exists(backup_dir):
+	print "Backup for %s already exists. Deleting it." % backup_dir
+	os.system("rm -rf %s" % backup_dir)
+
+    # generate the exclude rsync option
+    exclude_options = " ".join(["--exclude '%s'" % i for i in bak.exclude.split()])
+    # add the dest_dir to the exclude list to prevent backups of backups
+    exclude_options += " --exclude '%s'" % os.path.abspath(bak.dest_dir)
+
+    # Find latest backup that already exists to use as hardlink reference point
+    dirs = os.listdir(target_dir)
+    dirs.sort()
+    if(len(dirs) > 0):
+        linkdest_option = "--link-dest=" + os.path.abspath("%s/%s" % (target_dir, dirs[-1]))
+    else:
+        linkdest_option = ""
+
+    # Create new backup directory
+    os.mkdir(backup_dir)
+
+    # Perform the backup
+    cmd="rsync %s %s -az --delete %s %s:'%s' %s" % (exclude_options, bak.rsync_options, linkdest_option, bak.host, bak.sources, backup_dir)
+
+    print cmd
+    if os.system(cmd) != 0:
+        print "Failed to backup %s" % bak.name
+        os.system("rm -rf %s" % backup_dir)
+
+    # Remove old backup directories that have expired.  This works by
+    # looping through all the existing backups and evaluating them against
+    # the NUM_DAYS, NUM_WEEKS, NUM_MONTHS, and NUM_YEARS variables to
+    # determine if we should keep each one or not.
+
+    print "Checking for expired backups"
+    backups = os.listdir(target_dir)
+    backups.sort()
+    for backup in backups:
+        keep=False
+        backup_time = date(*map(int, backup.split("-")))
+
+        age = (now - backup_time).days
+        s = "%s (%d days old)" % (backup, age)
+        if(age <= bak.num_days):
+            keep=True
+            s += " (within %d days)" % bak.num_days
+
+        # If the day of this back up is Sunday, then we want to consider keeping
+        # it for both the NUM_WEEKS, NUM_MONTHS, and NUM_YEARS cycles
+        if backup_time.weekday() == 6:
+            # Keep anything within the last NUM_WEEKS weeks
+            if(age <= bak.num_weeks*7):
+                keep=True
+                s += " (within %d weeks)" % bak.num_weeks
+        
+            # Keep anything within NUM_MONTHS on 1st sunday of the month
+            if((age <= bak.num_months*31) and (backup_time.day < 8)):
+                keep=True
+                s += " (within %d months)" % bak.num_months
+
+            # Keep anything within NUM_YEARS on 1st sunday of the year
+            if((age <= bak.num_years*365) and (backup_time.day < 8) and (backup_time.month == 1)):
+                keep=True
+                s+= " (within %d years)" % bak.num_years
+	
+        # Delete anything that we did not keep
+        if not keep:
+            s += " (Removing expired backup)"
+            print s
+	    os.system("rm -rf %s/%s" % (target_dir, backup))
+        else:
+            print s
